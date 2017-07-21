@@ -1,0 +1,9 @@
+
+pyspark --packages graphframes:graphframes:0.5.0-spark2.1-s_2.11 --jars  /home/hdpmdrclusterssh/mysql-connector-java.jar 
+
+from pyspark.sql import HiveContext
+hc = HiveContext(sc)
+from graphframes import *
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+sc.setLogLevel("WARN")
