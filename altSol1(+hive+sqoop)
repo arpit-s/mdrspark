@@ -1,0 +1,51 @@
+
+class CommonClass:
+    def dataFromHive(self):             # getting a dataframe out of query.    
+        self.doctorsFromClinic =  hc.sql(" SELECT doctor_id AS id FROM default.docClinic")
+        self.df2 =  hc.sql(" SELECT doctor_id AS id,patient_id FROM default.appointments")
+        self.df = hc.sql("SELECT * from default.final")
+    def getDocTotPat(self):
+        refDF = self.df2.groupBy("id").count().toDF('id','count')
+        self.df = self.df.join(refDF,refDF.id==self.df.src).drop('id').withColumnRenamed('count','count_src')
+        self.df = self.df.join(refDF,refDF.id==self.df.dst).drop('id').withColumnRenamed('count','count_dst')
+    def calCmnPatScore(self):
+        self.df = self.df.withColumn('score_cmn_pat',self.df.cnt*100/(self.df.count_src+self.df.count_dst-self.df.cnt))
+    def wtdFinalScore(self):
+        self.df = self.df.withColumn('final_score',self.df.clinic_exist*0.5*100+self.df.score_cmn_pat*0.5)
+    def createGF(self):
+        self.vertices = self.doctorsFromClinic.distinct()
+        self.edges = self.df.select("src","dst","final_score").filter("final_score>0.0").distinct()
+        self.gf = GraphFrame(self.vertices,self.edges)
+    def writeToDataLake(self):
+        self.gf.vertices.write.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_v")
+        self.gf.edges.write.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_e")
+    def readFromDataLake(self):
+        self.vertices = sqlContext.read.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_v")
+        self.edges = sqlContext.read.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_e")
+    def strongRelated(self,var):
+        df  = self.gf.find("(a)-[e]->(b)").filter("a.id={}".format(var)).filter("e.final_score>0.0").orderBy(desc("e.final_score")).select("a.id","b.id","e.final_score").toDF('fromDoctor','toDoctor','strength').distinct()
+        window = Window.partitionBy(df['fromDoctor']).orderBy(df['strength'].desc())
+        rows = df.select('*', rank().over(window).toDF('rank')).filter(col('rank') <= 2).collect() 
+        return rows
+
+objX= CommonClass()
+objX.dataFromHive
+objX.df.persist()
+objX.getDocTotPat()
+objX.calCmnPatScore()
+objX.wtdFinalScore()
+objX.createGF()
+objX.df.unpersist()
+objX.writeToDataLake()
+objX.readFromDataLake()
+objX.gf.unpersist()
+edge = objX.edges.select("src").distinct().toPandas()
+
+df = sqlContext.createDataFrame([(0,0,0,0)],['fromDoctor', 'toDoctor', 'strength','rank'])      
+df.persist()  
+for index, row in edge.iterrows():
+    var = row['src']
+    roww_rdd = obj.strongRelated(var)
+    roww_df = sqlContext.createDataFrame(roww_rdd)
+    df = df.unionAll(roww_df)
+df.toPandas().to_csv("run2.csv")
