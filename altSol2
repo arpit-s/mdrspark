@@ -1,0 +1,92 @@
+
+class mainClass:
+    def importTable(self,name):
+        nwTable = spark.read.format("jdbc") \
+        .option("driver", "com.mysql.jdbc.Driver") \
+        .option("url", "jdbc:mysql://10.0.0.13:3306/manadr?zeroDateTimeBehavior=convertToNull") \
+        .option("dbtable", (name)) \
+        .option("user", "sqluser") \
+        .option("password", "uirocks214").load()
+        return nwTable
+    def buildRelation(self,tbname,betwen,relBy):
+        A = tbname
+        B = A 
+        nwRelation = A.select(betwen,relBy).toDF('A_bet','A_relBy') \
+        .crossJoin(B.select(betwen,relBy).toDF('B_bet','B_relBy')) \
+        .filter("(A_bet <> B_bet) AND (A_relBy = B_relBy)") \
+        .drop('A_relBy') \
+        .toDF('src','dst',relBy) \
+        .distinct()
+        return nwRelation    
+    def initializevar(self):
+        self.docClinic = self.importTable("doctor_clinics")
+        self.appointments = self.importTable("appointments")      
+    def relationTable(self):    
+        self.relationDocClinic = self.buildRelation(self.docClinic,"doctor_id","clinic_id")
+        self.relationDocPatient = self.buildRelation(self.appointments,"doctor_id","patient_id")
+    def updateCase(self):
+        self.df  = self.docClinincN.select("doctor_id AS id")
+        self.newVertices = self.docClinic.unionAll(self.df).distinct()
+        self.df = self.df.crossJoin(self.newVertices).filter("self.df.id<>self.newVertices.id").toDF("src","dst")
+        self.docClinic = self.docClinic.unionAll(self.docClinincN)
+        self.appointments = self.appointments.unionAll(self.appointmentsN)
+        self.df.persist()
+    def createCase(self):
+        vertices = self.docClinic.select("doctor_id").distinct().toDF("src")
+        verticesB =vertices.toDF("dst")
+        self.df = vertices.crossJoin(verticesB).filter("src<>dst")
+        self.df.persist()
+    def scoreClinicExist(self):
+        foo = self.relationDocClinic \
+                .groupBy("src","dst").count() \
+                .filter("count>0") \
+                .withColumn('clinic_exist',lit(100)) \
+                .toDF("src_foo","dst_foo","count_foo","clinic_exist")
+        self.df = self.df.join(foo,(foo.src_foo == self.df.src) & (foo.dst_foo == self.df.dst),'inner') \
+                    .drop("src_foo","dst_foo","count_foo")
+    def commonPatient(self):
+        foo = self.relationDocPatient.groupBy("src","dst").count().toDF("src_cmn","dst_cmn","cmnPat")
+        self.df = self.df.join(foo,(foo.src_cmn == self.df.src) & (foo.dst_cmn == self.df.dst),'inner')
+    def getDocTotPat(self):
+        refDF = self.appointments.groupBy("doctor_id").count().toDF('id','count')
+        self.df = self.df.join(refDF,refDF.id==self.df.src).drop('id').withColumnRenamed('count','count_src')
+        self.df = self.df.join(refDF,refDF.id==self.df.dst).drop('id').withColumnRenamed('count','count_dst')
+    def calCmnPatScore(self):
+        self.df = self.df.withColumn('score_cmn_pat',self.df.cmnPat*100/(self.df.count_src+self.df.count_dst-self.df.cmnPat))
+    def wtdFinalScore(self):
+        self.df = self.df.withColumn('final_score',self.df.clinic_exist*0.5*100+self.df.score_cmn_pat*0.5)
+    def initializeCreateCase(self):
+        self.initializevar()
+        self.relationTable()
+        self.createCase()
+    def initializeUpdateCase(self,docClinincN,appointmentsN):
+        self.readFromDataLake()
+        self.docClinincN = docClinincN
+        self.appointmentsN = appointmentsN
+        self.updateCase()
+    def processGF(self):
+        self.scoreClinicExist()
+        self.commonPatient()
+        self.getDocTotPat()
+        self.calCmnPatScore()
+        self.wtdFinalScore()
+        self.vertices = self.df.select("src").toDF("id").distinct()
+        self.edges = self.df.select("src","dst","final_score").filter("final_score>0.0").distinct()
+        self.gf = GraphFrame(self.vertices,self.edges)
+        self.df.unpersist()
+    def writeToDataLake(self):
+        self.gf.vertices.write.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_v")
+        self.gf.edges.write.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_e")
+    def readFromDataLake(self):
+        self.vertices = sqlContext.read.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_v")
+        self.edges = sqlContext.read.parquet("adl://mdrstore.azuredatalakestore.net/sparkFiles/graph1_e")
+    def strongRelated(self,var):
+        df  = self.gf.find("(a)-[e]->(b)").filter("a.id={}".format(var)).filter("e.final_score>0.0").orderBy(desc("e.final_score")).select("a.id","b.id","e.final_score").toDF('fromDoctor','toDoctor','strength').distinct()
+        window = Window.partitionBy(df['fromDoctor']).orderBy(df['strength'].desc())
+        rows = df.select('*', rank().over(window).toDF('rank')).filter(col('rank') <= 2).collect() 
+        return rows
+
+
+obj = mainClass()
+obj.initializeCreateCase()
+obj.processGF()
